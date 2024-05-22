@@ -8,9 +8,16 @@ set(OpenCV_DIR ./opencv)
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-file(GLOB SRC_LIST CONFIGURE_DEPENDS src/*.cpp src/*.h)
+add_subdirectory(MaxFlow)
 
+file(GLOB SRC_LIST CONFIGURE_DEPENDS src/*.cpp src/*.h)
 add_executable(${PROJECT_NAME} ${SRC_LIST})
 
-target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
+target_link_libraries(${PROJECT_NAME} 
+						PUBLIC ${OpenCV_LIBS} 
+						PUBLIC MaxFlow)
 
+target_include_directories(${PROJECT_NAME} PUBLIC
+                          "${PROJECT_BINARY_DIR}"
+                          "${PROJECT_SOURCE_DIR}/maxflow"
+                          )

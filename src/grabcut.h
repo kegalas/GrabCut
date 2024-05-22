@@ -3,12 +3,25 @@
 
 #include <opencv2/opencv.hpp>
 #include <cmath>
+#include <graph.h>
+
+namespace GC{
+
+double const PI = acos(-1);
+double constexpr EPS = 1e-9;
+
+enum
+{
+    BGD    = 0,  // 肯定是背景
+    FGD    = 1,  // 肯定是前景
+    MAY_BGD = 2,  // 更可能是背景
+    MAY_FGD = 3   // 更可能是前景
+};
 
 class GMM{
 public:
-    static int const K = 5; // 论文中指出，高斯混合模型的K值取5为佳
+    static int constexpr K = 5; // 论文中指出，高斯混合模型的K值取5为佳
 private:
-    double const PI = acos(-1);
 
     double coefs[K];    // 高斯模型的混合参数
     cv::Mat mean[K];  // 均值，RGB分别的
@@ -17,10 +30,11 @@ private:
     double covDet[K];   // cov的行列式
     cv::Mat covInv[K];   // 协方差的逆矩阵
 
-    size_t sampleCnt[K];
-    size_t totalSampleCnt;
+    size_t sampleCnt[K]; // 该分量的样本数
+    size_t totalSampleCnt; // 样本总数
 
-    cv::Mat colorSum[K];
+    cv::Mat colorSum[K]; // 用于计算均值
+    cv::Mat colorProdSum[K]; // 用于计算协方差
 
 public:
     GMM(){
@@ -36,7 +50,7 @@ public:
         totalSampleCnt = 0;
 
         std::fill(colorSum, colorSum+K, cv::Mat::zeros(3, 1, CV_64FC1));
-
+        std::fill(colorProdSum, colorProdSum+K, cv::Mat::zeros(3, 3, CV_64FC1));
     }
 
     double possibility(int ki, cv::Vec3d const & color){
@@ -90,9 +104,144 @@ public:
 
     void addSample(int ki, cv::Vec3d const & color){
         // 向第ki个分量添加一个样本
+        colorSum[ki] += cv::Mat(color);
+        colorProdSum[ki] += cv::Mat(color)*cv::Mat(color).t();
+        sampleCnt[ki]++;
+        totalSampleCnt++;
+    }
 
+    void deleteAllSamples(){
+        // 删除所有分量中的样本信息
+        for(int ki=0;ki<K;ki++){
+            colorSum[ki].setTo(cv::Scalar(0));
+            colorProdSum[ki].setTo(cv::Scalar(0));
+            sampleCnt[ki] = 0;
+        }
+        totalSampleCnt = 0;
+    }
+
+    void calcMeanAndCovWithSamples(){
+        // 根据样本来计算每个分量各自的均值和协方差
+        for(int ki=0;ki<K;ki++){
+            int n = sampleCnt[ki];
+            if(n==0){
+                coefs[ki] = 0;
+                continue;
+            }
+
+            coefs[ki] = static_cast<double>(n)/totalSampleCnt;
+            mean[ki] = colorSum[ki] / n;
+            cov[ki] = colorProdSum[ki]/n - mean[ki]*mean[ki].t();
+            double dt = cv::determinant(cov[ki]);
+            if(dt<EPS){
+                cov[ki].at<double>(0,0) += 0.01;
+                cov[ki].at<double>(1,1) += 0.01;
+                cov[ki].at<double>(2,2) += 0.01;
+            }
+
+            calcCovInvAndDet(ki);
+        }
     }
 };
+
+double calcBeta(cv::Mat const & img){
+    // 计算beta，见原论文公式(5)
+    double beta = 0.0;
+    size_t cnt = 0;
+
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            cv::Vec3d color = img.at<cv::Vec3b>(i, j);
+            // 原论文这个公式因为只有黑白，所以是平方。我们这里有三个通道，计算内积
+            // 原论文这个相邻的像素是8个，我想试一下4个的情况
+            // 按照我的理解，beta是在全图意义上的期望，而不是每个像素都有一个beta
+            for(int di=-1;di<=1;di++){
+                for(int dj=-1;dj<=1;dj++){
+                    if(di==0&&dj==0) continue;
+                    int ii = i+di, jj = j+dj;
+                    if(ii>=0&&jj>=0&&ii<img.rows&&jj<img.cols){
+                        cnt++;
+                        cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(ii, jj));
+                        beta += delta.dot(delta);
+                    }
+                }
+            }
+        }
+    }
+
+    if(beta<EPS) beta = 0.0;
+    else beta = 1.0/(2.0*beta/cnt);
+    // 总共选中像素点的次数
+
+    return beta;
+}
+
+using GraphType = Graph<double, double, double>;
+
+void buildSmoothnessTermGraph(GraphType* g, cv::Mat const & img, cv::Mat const & mask, double beta, double gamma = 50.0){
+    // 传入一个图、一张图片、一个mask，beta的计算见前，gamma在论文中默认给50
+    // 计算平滑项，即图片上的节点的边权，似乎在graph cut的论文里叫n weights
+    g->reset();
+    g->add_node(img.rows*img.cols);
+
+    auto maskEqu = [&mask](int i1, int j1, int i2, int j2){
+        return (mask.at<int>(i1,j1)&1)!=(mask.at<int>(i2,j2)&1);
+    };
+
+    // 原文在grabcut部分不再有dis^-1这一项，但是opencv的实现有，怀疑是论文弄错了
+    auto calcWeight = [&img, &beta, &gamma](int i1, int j1, int i2, int j2){
+        cv::Vec3d color = img.at<cv::Vec3b>(i1, j1);
+        cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
+        return gamma*cv::exp(-beta*delta.dot(delta));
+    };
+
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            int idx1 = i*img.cols+j;
+
+            // 只需要对每个节点的左、左上、上、右上建边，就可以防止重复建边
+            if(i>0 && maskEqu(i, j, i-1, j)){
+                int idx2 = (i-1)*img.cols+j;
+                double weight = calcWeight(i, j, i-1, j);
+                g->add_edge(idx1, idx2, weight, weight);
+            }
+            if(j>0 && maskEqu(i, j, i, j-1)){
+                int idx2 = i*img.cols+j-1;
+                double weight = calcWeight(i, j, i, j-1);
+                g->add_edge(idx1, idx2, weight, weight);
+            }
+            if(i>0 && j>0 && maskEqu(i, j, i-1, j-1)){
+                int idx2 = (i-1)*img.cols+j-1;
+                double weight = calcWeight(i, j, i-1, j-1);
+                g->add_edge(idx1, idx2, weight, weight);
+            }
+            if(i>0 && j<img.cols-1 && maskEqu(i, j, i-1, j+1)){
+                int idx2 = (i-1)*img.cols+j+1;
+                double weight = calcWeight(i, j, i-1, j+1);
+                g->add_edge(idx1, idx2, weight, weight);
+            }
+        }
+    }
+}
+
+void initMask(cv::Mat& mask, cv::Size imgSz, cv::Rect rect){
+    // 通过一个矩形来初始化Mask，和论文中描述的一致，框内可能是前景，框外一定是背景
+    mask.create(imgSz, CV_8UC1);
+    mask.setTo(cv::Scalar(BGD));
+
+    rect.x = std::max(0, rect.x);
+    rect.y = std::max(0, rect.y);
+    rect.width = std::min(rect.width, imgSz.width-rect.x);
+    rect.height = std::min(rect.height, imgSz.height-rect.y);
+
+    mask(rect).setTo(cv::Scalar(MAY_FGD));
+}
+
+void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& bgdGMM, GMM& fgdGMM){
+
+}
+
+} // namespace GC
 
 #endif
 
