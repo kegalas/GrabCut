@@ -4,6 +4,8 @@
 #include <opencv2/opencv.hpp>
 #include <cmath>
 #include <graph.h>
+#include <random>
+#include <ctime>
 
 namespace GC{
 
@@ -53,7 +55,7 @@ public:
         std::fill(colorProdSum, colorProdSum+K, cv::Mat::zeros(3, 3, CV_64FC1));
     }
 
-    double possibility(int ki, cv::Vec3d const & color){
+    double possibility(int ki, cv::Vec3d const & color) const {
         // 某个color属于第ki个分量的概率
         double ret=0.0;
         if(coefs[ki]<=0) return ret;
@@ -69,7 +71,7 @@ public:
         return ret;
     }
 
-    double possibility(cv::Vec3d const & color){
+    double possibility(cv::Vec3d const & color) const {
         // 所有分量概率的和
         double ret = 0.0;
 
@@ -80,7 +82,7 @@ public:
         return ret;
     }
 
-    int whichComponent(cv::Vec3d const & color){
+    int whichComponent(cv::Vec3d const & color) const {
         // 输出某个颜色应该属于哪个分量，即概率最大的那个分量
         int k=0;
         double maxv=0.0;
@@ -144,6 +146,61 @@ public:
     }
 };
 
+std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=GMM::K, int iterCnt = 20){
+    std::vector<uint8_t> labels;
+    std::vector<cv::Vec3d> classCenter(classNum);
+    std::vector<int> idx(colors.size());
+
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    int sz=colors.size();
+
+    assert(sz>=classNum);
+
+    for(int i=0;i<sz;i++){
+        idx[i] = i;
+    }
+    std::shuffle(idx.begin(), idx.end(), rng);
+
+    for(int i=0;i<classNum;i++){
+        classCenter[i] = colors[idx[i]];
+    }
+
+    std::vector<int> classCnt(classNum);
+    std::vector<cv::Vec3d> classColorSum(classNum);
+    auto init = [&classCnt, &classColorSum, &classNum](){
+        for(int i=0;i<classNum;i++){
+            classCnt[i] = 0;
+            classColorSum[i] = cv::Vec3d(0.0,0.0,0.0);
+        }
+    };
+
+    while(iterCnt--){
+        init();
+        for(int i=0;i<sz;i++){
+            double mindis = 1e15;
+            int minc = 0;
+            for(int j=0;j<classNum;j++){
+                cv::Vec3d delta = colors[i] - classCenter[j];
+                double dis = delta.dot(delta);
+                if(mindis>dis){
+                    mindis = dis;
+                    minc = j;
+                }
+            }
+            ++classCnt[minc];
+            classColorSum[minc] += colors[i];
+            labels[i] = minc;
+        }
+        for(int j=0;j<classNum;j++){
+            classCenter[j] = classColorSum[j] / classCnt[j];
+        }
+    }
+
+    return labels;
+}
+
 double calcBeta(cv::Mat const & img){
     // 计算beta，见原论文公式(5)
     double beta = 0.0;
@@ -175,6 +232,10 @@ double calcBeta(cv::Mat const & img){
 
     return beta;
 }
+
+class GCGraph{
+
+};
 
 using GraphType = Graph<double, double, double>;
 
@@ -237,8 +298,66 @@ void initMask(cv::Mat& mask, cv::Size imgSz, cv::Rect rect){
     mask(rect).setTo(cv::Scalar(MAY_FGD));
 }
 
-void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& bgdGMM, GMM& fgdGMM){
+void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& fgdGMM, GMM& bgdGMM){
+    // 使用K-means算法把BGD和FGB各自的初始节点分为K类，然后放到对应的GMM分量中
+    std::vector<cv::Vec3d> bgdSamples, fgdSamples;
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            if(mask.at<uint8_t>(i,j)&1){
+                fgdSamples.push_back(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+            else{
+                bgdSamples.push_back(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+        }
+    }
+    std::vector<uint8_t> fgdLabel = kMeans(fgdSamples);
+    std::vector<uint8_t> bgdLabel = kMeans(bgdSamples);
 
+    fgdGMM.deleteAllSamples();
+    for(int i=0, sz=fgdLabel.size();i<sz;i++){
+        fgdGMM.addSample(fgdLabel[i], fgdSamples[i]);
+    }
+    fgdGMM.calcMeanAndCovWithSamples();
+
+    bgdGMM.deleteAllSamples();
+    for(int i=0, sz=bgdLabel.size();i<sz;i++){
+        bgdGMM.addSample(bgdLabel[i], bgdSamples[i]);
+    }
+    bgdGMM.calcMeanAndCovWithSamples();
+}
+
+void assignGMMsToPixels(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, cv::Mat& PixToComp){
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            if(mask.at<uint8_t>(i,j)&1){
+                PixToComp.at<uint8_t>(i,j) = fgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+            else{
+                PixToComp.at<uint8_t>(i,j) = bgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+        }
+    }
+}
+
+void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bgdGMM, cv::Mat const & PixToComp){
+    fgdGMM.deleteAllSamples();
+    bgdGMM.deleteAllSamples();
+
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            int ki = PixToComp.at<uint8_t>(i, j);
+            if(mask.at<uint8_t>(i,j)&1){
+                fgdGMM.addSample(ki, static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+            else{
+                bgdGMM.addSample(ki, static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+        }
+    }
+
+    fgdGMM.calcMeanAndCovWithSamples();
+    bgdGMM.calcMeanAndCovWithSamples();
 }
 
 } // namespace GC
