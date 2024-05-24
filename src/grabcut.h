@@ -63,6 +63,7 @@ public:
 
         cv::Mat delta = cv::Mat(color)-mean[ki];
         cv::Mat m = delta.t() * covInv[ki] * delta;
+        assert(m.cols==1 && m.rows==1);
         double mult = -0.5 * m.at<double>(0,0);
 
         ret = 1.0/pow((2.0*PI), 3.0/2.0);
@@ -77,7 +78,7 @@ public:
         double ret = 0.0;
 
         for(int ki=0;ki<K;ki++){
-            ret += possibility(ki, color);
+            ret += coefs[ki] * possibility(ki, color);
         }
 
         return ret;
@@ -119,6 +120,9 @@ public:
             colorSum[ki].setTo(cv::Scalar(0));
             colorProdSum[ki].setTo(cv::Scalar(0));
             sampleCnt[ki] = 0;
+            coefs[ki] = 0.0;
+            mean[ki] = cv::Mat::zeros(3, 1, CV_64FC1);
+            cov[ki] = cv::Mat::zeros(3, 3, CV_64FC1);
         }
         totalSampleCnt = 0;
     }
@@ -147,7 +151,7 @@ public:
     }
 };
 
-std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=GMM::K, int iterCnt = 20){
+std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=GMM::K, int iterCnt = 10){
     std::vector<uint8_t> labels(colors.size());
     std::vector<cv::Vec3d> classCenter(classNum);
     std::vector<int> idx(colors.size());
@@ -248,13 +252,21 @@ private:
         g->add_node(img.rows*img.cols);
 
         auto maskEqu = [&mask](int i1, int j1, int i2, int j2){
-            return (mask.at<int>(i1,j1)&1)!=(mask.at<int>(i2,j2)&1);
+            return true;
+//            int mk1 = mask.at<int>(i1,j1), mk2 = mask.at<int>(i2,j2);
+//            if(mk1>1||mk2>1) return true;
+//            return mk1 != mk2;
+            // 经过测试，原文中说的艾弗森括号[alpha_n != alpha_m]，无论以什么角度去理解，都不如直接全部返回true
+            // 比较怀疑是因为这里是软segmentation，大家的alpha都不一样，所以干脆全部返回true
         };
 
-        // 原文在grabcut部分不再有dis^-1这一项，但是opencv的实现有，怀疑是论文弄错了
+        // 原文在grabcut部分不再有dis^-1这一项，但是opencv的实现有
+        // 自己测试发现有没有不太影响
         auto calcWeight = [&img, &beta, &gamma](int i1, int j1, int i2, int j2){
             cv::Vec3d color = img.at<cv::Vec3b>(i1, j1);
             cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
+//            if(std::abs(i1-i2)+std::abs(j1-j2)==2)
+//                return gamma/std::sqrt(2)*cv::exp(-beta*delta.dot(delta)); // 即dis^-1
             return gamma*cv::exp(-beta*delta.dot(delta));
         };
 
@@ -313,12 +325,16 @@ private:
                 cv::Vec3d color = img.at<cv::Vec3b>(i, j);
                 uint8_t mk = mask.at<uint8_t>(i, j);
                 if(mk==MAY_FGD || mk==MAY_BGD){
-                    sw = -cv::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是背景
-                    tw = -cv::log(fgdGMM.possibility(color)); // 汇点那边是前景
+                    sw = -cv::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是前景
+                    tw = -cv::log(fgdGMM.possibility(color)); // 汇点那边是背景。
+                    // 这里是惩罚项（正数），即分类错误的惩罚。我们需要使惩罚最小，能量最小
+                    // grab cut的论文虽然说的是和k_n有关，但经过测试发现，没有k_n，而是所有概率加和的惩罚项明显更好
+                    // 即，不使用-cv::log(bgdGMM.possibility(ki, color))
                 }
+//                else continue;
                 else if(mk==FGD){
-                    sw = kTerm;
-                    tw = 0;
+                    sw = kTerm; // 见graph cut论文，这一部分没有在grab cut中提到
+                    tw = 0;     // 但是我测试过后，神奇地发现直接去掉也可以
                 }
                 else{
                     sw = 0;
@@ -337,11 +353,11 @@ public:
         g->reset();
     }
 
-    void buildGraph(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, double beta){
+    void buildGraph(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, double beta, double gamma = 50.0){
         g->reset();
         kTerm = 0.0;
 
-        addNLinks(img, mask, beta);
+        addNLinks(img, mask, beta, gamma);
         addTLinks(img, mask, fgdGMM, bgdGMM);
     }
 
