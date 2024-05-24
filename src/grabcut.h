@@ -6,6 +6,7 @@
 #include <graph.h>
 #include <random>
 #include <ctime>
+#include <memory>
 
 namespace GC{
 
@@ -147,7 +148,7 @@ public:
 };
 
 std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=GMM::K, int iterCnt = 20){
-    std::vector<uint8_t> labels;
+    std::vector<uint8_t> labels(colors.size());
     std::vector<cv::Vec3d> classCenter(classNum);
     std::vector<int> idx(colors.size());
 
@@ -210,7 +211,7 @@ double calcBeta(cv::Mat const & img){
         for(int j=0;j<img.cols;j++){
             cv::Vec3d color = img.at<cv::Vec3b>(i, j);
             // 原论文这个公式因为只有黑白，所以是平方。我们这里有三个通道，计算内积
-            // 原论文这个相邻的像素是8个，我想试一下4个的情况
+            // 原论文这个相邻的像素是8个
             // 按照我的理解，beta是在全图意义上的期望，而不是每个像素都有一个beta
             for(int di=-1;di<=1;di++){
                 for(int dj=-1;dj<=1;dj++){
@@ -234,56 +235,138 @@ double calcBeta(cv::Mat const & img){
 }
 
 class GCGraph{
+public:
+    using GraphType = Graph<double, double, double>;
 
-};
+private:
+    std::unique_ptr<GraphType> g;
+    double kTerm; // graph cut的论文中，t weights的一种取值
 
-using GraphType = Graph<double, double, double>;
+    void addNLinks(cv::Mat const & img, cv::Mat const & mask, double beta, double gamma = 50.0){
+        // 传入一个图、一张图片、一个mask，beta的计算见前，gamma在论文中默认给50
+        // 计算平滑项，即图片上的节点的边权，似乎在graph cut的论文里叫n weights、n links
+        g->add_node(img.rows*img.cols);
 
-void buildSmoothnessTermGraph(GraphType* g, cv::Mat const & img, cv::Mat const & mask, double beta, double gamma = 50.0){
-    // 传入一个图、一张图片、一个mask，beta的计算见前，gamma在论文中默认给50
-    // 计算平滑项，即图片上的节点的边权，似乎在graph cut的论文里叫n weights
-    g->reset();
-    g->add_node(img.rows*img.cols);
+        auto maskEqu = [&mask](int i1, int j1, int i2, int j2){
+            return (mask.at<int>(i1,j1)&1)!=(mask.at<int>(i2,j2)&1);
+        };
 
-    auto maskEqu = [&mask](int i1, int j1, int i2, int j2){
-        return (mask.at<int>(i1,j1)&1)!=(mask.at<int>(i2,j2)&1);
-    };
+        // 原文在grabcut部分不再有dis^-1这一项，但是opencv的实现有，怀疑是论文弄错了
+        auto calcWeight = [&img, &beta, &gamma](int i1, int j1, int i2, int j2){
+            cv::Vec3d color = img.at<cv::Vec3b>(i1, j1);
+            cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
+            return gamma*cv::exp(-beta*delta.dot(delta));
+        };
 
-    // 原文在grabcut部分不再有dis^-1这一项，但是opencv的实现有，怀疑是论文弄错了
-    auto calcWeight = [&img, &beta, &gamma](int i1, int j1, int i2, int j2){
-        cv::Vec3d color = img.at<cv::Vec3b>(i1, j1);
-        cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
-        return gamma*cv::exp(-beta*delta.dot(delta));
-    };
+        auto coordToIdx = [&img](int i, int j){
+            return i*img.cols+j;
+        };
 
-    for(int i=0;i<img.rows;i++){
-        for(int j=0;j<img.cols;j++){
-            int idx1 = i*img.cols+j;
+        for(int i=0;i<img.rows;i++){
+            for(int j=0;j<img.cols;j++){
+                int idx1 = coordToIdx(i, j);
 
-            // 只需要对每个节点的左、左上、上、右上建边，就可以防止重复建边
-            if(i>0 && maskEqu(i, j, i-1, j)){
-                int idx2 = (i-1)*img.cols+j;
-                double weight = calcWeight(i, j, i-1, j);
-                g->add_edge(idx1, idx2, weight, weight);
+                double sum_weight=0.0;
+                // 只需要对每个节点的左、左上、上、右上建边，就可以防止重复建边
+                if(i>0 && maskEqu(i, j, i-1, j)){
+                    int idx2 = coordToIdx(i-1, j);
+                    double weight = calcWeight(i, j, i-1, j);
+                    sum_weight+=weight;
+                    g->add_edge(idx1, idx2, weight, weight);
+                }
+                if(j>0 && maskEqu(i, j, i, j-1)){
+                    int idx2 = coordToIdx(i, j-1);
+                    double weight = calcWeight(i, j, i, j-1);
+                    sum_weight+=weight;
+                    g->add_edge(idx1, idx2, weight, weight);
+                }
+                if(i>0 && j>0 && maskEqu(i, j, i-1, j-1)){
+                    int idx2 = coordToIdx(i-1, j-1);
+                    double weight = calcWeight(i, j, i-1, j-1);
+                    sum_weight+=weight;
+                    g->add_edge(idx1, idx2, weight, weight);
+                }
+                if(i>0 && j<img.cols-1 && maskEqu(i, j, i-1, j+1)){
+                    int idx2 = coordToIdx(i-1, j+1);
+                    double weight = calcWeight(i, j, i-1, j+1);
+                    sum_weight+=weight;
+                    g->add_edge(idx1, idx2, weight, weight);
+                }
+                kTerm = std::max(kTerm, sum_weight);
             }
-            if(j>0 && maskEqu(i, j, i, j-1)){
-                int idx2 = i*img.cols+j-1;
-                double weight = calcWeight(i, j, i, j-1);
-                g->add_edge(idx1, idx2, weight, weight);
-            }
-            if(i>0 && j>0 && maskEqu(i, j, i-1, j-1)){
-                int idx2 = (i-1)*img.cols+j-1;
-                double weight = calcWeight(i, j, i-1, j-1);
-                g->add_edge(idx1, idx2, weight, weight);
-            }
-            if(i>0 && j<img.cols-1 && maskEqu(i, j, i-1, j+1)){
-                int idx2 = (i-1)*img.cols+j+1;
-                double weight = calcWeight(i, j, i-1, j+1);
-                g->add_edge(idx1, idx2, weight, weight);
+        }
+        kTerm += 1.0;
+    }
+
+    void addTLinks(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM){
+        // 传入图像和mask
+        // 添加数据项，即图上的像素到源点汇点的边权，似乎在graph cut的论文里叫t weights、t links
+
+        auto coordToIdx = [&img](int i, int j){
+            return i*img.cols+j;
+        };
+
+        for(int i=0;i<img.rows;i++){
+            for(int j=0;j<img.cols;j++){
+                double sw, tw; // 到源点的权值，到汇点的权值
+
+                cv::Vec3d color = img.at<cv::Vec3b>(i, j);
+                uint8_t mk = mask.at<uint8_t>(i, j);
+                if(mk==MAY_FGD || mk==MAY_BGD){
+                    sw = -cv::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是背景
+                    tw = -cv::log(fgdGMM.possibility(color)); // 汇点那边是前景
+                }
+                else if(mk==FGD){
+                    sw = kTerm;
+                    tw = 0;
+                }
+                else{
+                    sw = 0;
+                    tw = kTerm;
+                }
+
+                g->add_tweights(coordToIdx(i, j), sw, tw);
             }
         }
     }
-}
+
+public:
+    GCGraph(int nodeNumMax_, int edgeNumMax_):  g(std::make_unique<GraphType>(nodeNumMax_, edgeNumMax_)),
+                                                kTerm(0.0){}
+    ~GCGraph(){
+        g->reset();
+    }
+
+    void buildGraph(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, double beta){
+        g->reset();
+        kTerm = 0.0;
+
+        addNLinks(img, mask, beta);
+        addTLinks(img, mask, fgdGMM, bgdGMM);
+    }
+
+    void estimateSegmentation(cv::Mat & mask){
+        g->maxflow();
+        auto coordToIdx = [&mask](int i, int j){
+            return i*mask.cols+j;
+        };
+
+        for(int i=0;i<mask.rows;i++){
+            for(int j=0;j<mask.cols;j++){
+                uint8_t mk = mask.at<uint8_t>(i, j);
+                if(mk==MAY_FGD || mk==MAY_BGD){
+                    if(g->what_segment(coordToIdx(i,j))==GraphType::SOURCE){
+                        mask.at<uint8_t>(i, j) = MAY_FGD;
+                    }
+                    else{
+                        mask.at<uint8_t>(i, j) = MAY_BGD;
+                    }
+                }
+            }
+        }
+    }
+
+};
 
 void initMask(cv::Mat& mask, cv::Size imgSz, cv::Rect rect){
     // 通过一个矩形来初始化Mask，和论文中描述的一致，框内可能是前景，框外一定是背景
@@ -295,7 +378,7 @@ void initMask(cv::Mat& mask, cv::Size imgSz, cv::Rect rect){
     rect.width = std::min(rect.width, imgSz.width-rect.x);
     rect.height = std::min(rect.height, imgSz.height-rect.y);
 
-    mask(rect).setTo(cv::Scalar(MAY_FGD));
+    (mask(rect)).setTo(cv::Scalar(MAY_FGD));
 }
 
 void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& fgdGMM, GMM& bgdGMM){
@@ -358,6 +441,27 @@ void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bg
 
     fgdGMM.calcMeanAndCovWithSamples();
     bgdGMM.calcMeanAndCovWithSamples();
+}
+
+void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20){
+    GMM fgdGMM, bgdGMM;
+    GCGraph gcg(img.rows*img.cols, img.rows*img.cols*8);
+    cv::Mat PixToComp;
+    PixToComp.create(img.size(), CV_8UC1);
+    assert(img.type()==CV_8UC3);
+    assert(mask.type()==CV_8UC1);
+
+    double const beta = calcBeta(img);
+
+    initGMMs(img, mask, fgdGMM, bgdGMM);
+
+    while(iterCnt--){
+        std::cout<<"left iter cnt: "<<iterCnt<<std::endl;
+        assignGMMsToPixels(img, mask, fgdGMM, bgdGMM, PixToComp);
+        learnGMMs(img, mask, fgdGMM, bgdGMM, PixToComp);
+        gcg.buildGraph(img, mask, fgdGMM, bgdGMM, beta);
+        gcg.estimateSegmentation(mask);
+    }
 }
 
 } // namespace GC
