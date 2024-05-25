@@ -3,7 +3,11 @@ project(GrabCut VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pg -no-pie -g")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -pg -no-pie -g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS} -O2 -DNDEBUG -pg -no-pie -g")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pg -no-pie -g -O0")
+
 
 set(OpenCV_DIR ./opencv)
 find_package(OpenCV REQUIRED)

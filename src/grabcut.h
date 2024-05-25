@@ -10,8 +10,9 @@
 
 namespace GC{
 
-double const PI = acos(-1);
+double const PI = std::acos(-1);
 double constexpr EPS = 1e-9;
+double const term1 = 1.0/std::pow((2.0*PI), 3.0/2.0); // 多元正态分布的一个因子
 
 enum
 {
@@ -21,39 +22,66 @@ enum
     MAY_FGD = 3   // 更可能是前景
 };
 
+
+inline double vTMv33(double const * vt, double const * m, double const * v){
+    return vt[0]*(v[0]*m[0]+v[1]*m[1]+v[2]*m[2])
+           + vt[1]*(v[0]*m[3]+v[1]*m[4]+v[2]*m[5])
+           + vt[2]*(v[0]*m[6]+v[1]*m[7]+v[2]*m[8]);
+}
+
+inline void vvT3AddTo(double * m_out, double const * v, double const * vT){
+    m_out[0] += v[0]*vT[0]; m_out[1] += v[0] * vT[1]; m_out[2] += v[0] * vT[2];
+    m_out[3] += v[1]*vT[0]; m_out[4] += v[1] * vT[1]; m_out[5] += v[1] * vT[2];
+    m_out[6] += v[2]*vT[0]; m_out[7] += v[2] * vT[1]; m_out[8] += v[2] * vT[2];
+}
+
+inline void vvT3SubTo(double * m_out, double const * v, double const * vT){
+    m_out[0] -= v[0]*vT[0]; m_out[1] -= v[0] * vT[1]; m_out[2] -= v[0] * vT[2];
+    m_out[3] -= v[1]*vT[0]; m_out[4] -= v[1] * vT[1]; m_out[5] -= v[1] * vT[2];
+    m_out[6] -= v[2]*vT[0]; m_out[7] -= v[2] * vT[1]; m_out[8] -= v[2] * vT[2];
+}
+
+inline double vTv3(double const * vt, double const * v){
+    return vt[0]*v[0] + vt[1]*v[1] + vt[2]*v[2];
+}
+
 class GMM{
 public:
     static int constexpr K = 5; // 论文中指出，高斯混合模型的K值取5为佳
 private:
 
     double coefs[K];    // 高斯模型的混合参数
-    cv::Mat mean[K];  // 均值，RGB分别的
-    cv::Mat cov[K];   // 协方差
+    cv::Vec3d mean[K];  // 均值，RGB分别的
+    cv::Matx33d cov[K];   // 协方差
 
     double covDet[K];   // cov的行列式
-    cv::Mat covInv[K];   // 协方差的逆矩阵
+    cv::Matx33d covInv[K];   // 协方差的逆矩阵
+    double covDetSqrtInv[K]; // cov的行列式的根号的倒数
 
     size_t sampleCnt[K]; // 该分量的样本数
     size_t totalSampleCnt; // 样本总数
 
-    cv::Mat colorSum[K]; // 用于计算均值
-    cv::Mat colorProdSum[K]; // 用于计算协方差
+    cv::Vec3d colorSum[K]; // 用于计算均值
+    cv::Matx33d colorProdSum[K]; // 用于计算协方差
 
 public:
     GMM(){
         // 混合参数1位，RGB三通道的均值3位，其协方差矩阵3x3即9位
+        // TODO: 初始化疑似可以优化
+        cv::Vec3d zv(0.0, 0.0, 0.0);
         std::fill(coefs, coefs+K, 0.0);
-        std::fill(mean, mean+K, cv::Mat::zeros(3, 1, CV_64FC1));
-        std::fill(cov, cov+K, cv::Mat::zeros(3, 3, CV_64FC1));
+        std::fill(mean, mean+K, zv);
+        std::fill(cov, cov+K, cv::Matx33d::zeros());
 
         std::fill(covDet, covDet+K, 0.0);
-        std::fill(covInv, covInv+K, cv::Mat::zeros(3, 3, CV_64FC1));
+        std::fill(covInv, covInv+K, cv::Matx33d::zeros());
+        std::fill(covDetSqrtInv, covDetSqrtInv+K, 0.0);
 
         std::fill(sampleCnt, sampleCnt+K, 0);
         totalSampleCnt = 0;
 
-        std::fill(colorSum, colorSum+K, cv::Mat::zeros(3, 1, CV_64FC1));
-        std::fill(colorProdSum, colorProdSum+K, cv::Mat::zeros(3, 3, CV_64FC1));
+        std::fill(colorSum, colorSum+K, zv);
+        std::fill(colorProdSum, colorProdSum+K, cv::Matx33d::zeros());
     }
 
     double possibility(int ki, cv::Vec3d const & color) const {
@@ -61,13 +89,13 @@ public:
         double ret=0.0;
         if(coefs[ki]<=0) return ret;
 
-        cv::Mat delta = cv::Mat(color)-mean[ki];
-        cv::Mat m = delta.t() * covInv[ki] * delta;
-        assert(m.cols==1 && m.rows==1);
-        double mult = -0.5 * m.at<double>(0,0);
+        cv::Vec3d delta = color-mean[ki];
+        //double m = (delta.t() * covInv[ki] * delta)[0]; // 暴力用下标去算更优，见下一行
+        double m = vTMv33(delta.val, covInv[ki].val, delta.val);
+        double mult = -0.5 * m;
 
-        ret = 1.0/pow((2.0*PI), 3.0/2.0);
-        ret /= sqrt(covDet[ki]);
+        ret = term1;
+        ret *= covDetSqrtInv[ki];
         ret *= cv::exp(mult);
 
         return ret;
@@ -103,13 +131,15 @@ public:
     void calcCovInvAndDet(int ki){
         if(coefs[ki]<=0) return;
         covDet[ki] = cv::determinant(cov[ki]);
+        covDetSqrtInv[ki] = 1.0/std::sqrt(covDet[ki]);
         cv::invert(cov[ki], covInv[ki]);
     }
 
     void addSample(int ki, cv::Vec3d const & color){
         // 向第ki个分量添加一个样本
-        colorSum[ki] += cv::Mat(color);
-        colorProdSum[ki] += cv::Mat(color)*cv::Mat(color).t();
+        colorSum[ki] += color;
+        //colorProdSum[ki] += color*color.t(); // // 暴力用下标去算更优，见下一行
+        vvT3AddTo(colorProdSum[ki].val, color.val, color.val);
         sampleCnt[ki]++;
         totalSampleCnt++;
     }
@@ -117,12 +147,9 @@ public:
     void deleteAllSamples(){
         // 删除所有分量中的样本信息
         for(int ki=0;ki<K;ki++){
-            colorSum[ki].setTo(cv::Scalar(0));
-            colorProdSum[ki].setTo(cv::Scalar(0));
+            std::fill(colorSum[ki].val, colorSum[ki].val+3, 0.0);
+            std::fill(colorProdSum[ki].val, colorProdSum[ki].val+9, 0.0);
             sampleCnt[ki] = 0;
-            coefs[ki] = 0.0;
-            mean[ki] = cv::Mat::zeros(3, 1, CV_64FC1);
-            cov[ki] = cv::Mat::zeros(3, 3, CV_64FC1);
         }
         totalSampleCnt = 0;
     }
@@ -138,12 +165,14 @@ public:
 
             coefs[ki] = static_cast<double>(n)/totalSampleCnt;
             mean[ki] = colorSum[ki] / n;
-            cov[ki] = colorProdSum[ki]/n - mean[ki]*mean[ki].t();
+            // cov[ki] = colorProdSum[ki]*(1.0/n) - mean[ki]*mean[ki].t(); // TODO: 可优化，暴力用val下标去算，可能可以减小构造开销
+            cov[ki] = colorProdSum[ki]*(1.0/n);
+            vvT3SubTo(cov[ki].val, mean[ki].val, mean[ki].val);
             double dt = cv::determinant(cov[ki]);
             if(dt<EPS){
-                cov[ki].at<double>(0,0) += 0.01;
-                cov[ki].at<double>(1,1) += 0.01;
-                cov[ki].at<double>(2,2) += 0.01;
+                cov[ki].val[0] += 0.01;
+                cov[ki].val[4] += 0.01;
+                cov[ki].val[8] += 0.01;
             }
 
             calcCovInvAndDet(ki);
@@ -177,7 +206,7 @@ std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=
     auto init = [&classCnt, &classColorSum, &classNum](){
         for(int i=0;i<classNum;i++){
             classCnt[i] = 0;
-            classColorSum[i] = cv::Vec3d(0.0,0.0,0.0);
+            std::fill(classColorSum[i].val, classColorSum[i].val+3, 0.0);
         }
     };
 
@@ -188,7 +217,7 @@ std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=
             int minc = 0;
             for(int j=0;j<classNum;j++){
                 cv::Vec3d delta = colors[i] - classCenter[j];
-                double dis = delta.dot(delta);
+                double dis = vTv3(delta.val, delta.val);
                 if(mindis>dis){
                     mindis = dis;
                     minc = j;
@@ -217,16 +246,26 @@ double calcBeta(cv::Mat const & img){
             // 原论文这个公式因为只有黑白，所以是平方。我们这里有三个通道，计算内积
             // 原论文这个相邻的像素是8个
             // 按照我的理解，beta是在全图意义上的期望，而不是每个像素都有一个beta
-            for(int di=-1;di<=1;di++){
-                for(int dj=-1;dj<=1;dj++){
-                    if(di==0&&dj==0) continue;
-                    int ii = i+di, jj = j+dj;
-                    if(ii>=0&&jj>=0&&ii<img.rows&&jj<img.cols){
-                        cnt++;
-                        cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(ii, jj));
-                        beta += delta.dot(delta);
-                    }
-                }
+
+            if(i>0){
+                cnt++;
+                cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i-1, j));
+                beta += vTv3(delta.val, delta.val);
+            }
+            if(j>0){
+                cnt++;
+                cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i, j-1));
+                beta += vTv3(delta.val, delta.val);
+            }
+            if(i>0 && j>0){
+                cnt++;
+                cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i-1, j-1));
+                beta += vTv3(delta.val, delta.val);
+            }
+            if(i>0 && j<img.cols-1){
+                cnt++;
+                cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i-1, j+1));
+                beta += vTv3(delta.val, delta.val);
             }
         }
     }
@@ -267,7 +306,7 @@ private:
             cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
 //            if(std::abs(i1-i2)+std::abs(j1-j2)==2)
 //                return gamma/std::sqrt(2)*cv::exp(-beta*delta.dot(delta)); // 即dis^-1
-            return gamma*cv::exp(-beta*delta.dot(delta));
+            return gamma*cv::exp(-beta*vTv3(delta.val, delta.val));
         };
 
         auto coordToIdx = [&img](int i, int j){
@@ -325,8 +364,8 @@ private:
                 cv::Vec3d color = img.at<cv::Vec3b>(i, j);
                 uint8_t mk = mask.at<uint8_t>(i, j);
                 if(mk==MAY_FGD || mk==MAY_BGD){
-                    sw = -cv::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是前景
-                    tw = -cv::log(fgdGMM.possibility(color)); // 汇点那边是背景。
+                    sw = -std::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是前景
+                    tw = -std::log(fgdGMM.possibility(color)); // 汇点那边是背景。
                     // 这里是惩罚项（正数），即分类错误的惩罚。我们需要使惩罚最小，能量最小
                     // grab cut的论文虽然说的是和k_n有关，但经过测试发现，没有k_n，而是所有概率加和的惩罚项明显更好
                     // 即，不使用-cv::log(bgdGMM.possibility(ki, color))

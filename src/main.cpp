@@ -4,6 +4,12 @@
 #include <string>
 
 int main() {
+//    cv::Matx33d mt = cv::Matx33d::ones();
+//    for(int i=0;i<9;i++){
+//        mt.val[i] = i;
+//    }
+//    std::cout<<mt<<"\n";
+
 //    cv::Rect rect(80, 9, 222, 220);
     cv::Rect rect(251,141,276,316);
 //    cv::Rect rect(69, 1, 682, 462);
@@ -32,22 +38,6 @@ int main() {
     }
 
     cv::imwrite("result.jpg", img);
-
-//    std::vector<cv::Vec3d> bgdSamples;
-//    for(int i=0;i<img.rows;i++){
-//        for(int j=0;j<img.cols;j++){
-//            uint8_t mk = mask.at<uint8_t>(i, j);
-//            if(mk&1){
-
-//            }
-//            else{
-//                bgdSamples.push_back((cv::Vec3d)img.at<cv::Vec3b>(i, j));
-//            }
-//        }
-//    }
-
-//    GC::GMM gmm1;
-//    gmm1.
 
     return 0;
 }
