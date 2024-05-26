@@ -2,11 +2,104 @@
 #define __grabcut__H__
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/highgui.hpp>
 #include <cmath>
 #include <graph.h>
 #include <random>
 #include <ctime>
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <future>
+#include <queue>
+#include <functional>
+#include <atomic>
+
+class ThreadPool {
+    // https://github.com/progschj/ThreadPool/blob/master/ThreadPool.h
+public:
+    ThreadPool(size_t);
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args)
+        -> std::future<typename std::result_of<F(Args...)>::type>;
+    ~ThreadPool();
+private:
+    // need to keep track of threads so we can join them
+    std::vector< std::thread > workers;
+    // the task queue
+    std::queue< std::function<void()> > tasks;
+
+    // synchronization
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
+
+// the constructor just launches some amount of workers
+inline ThreadPool::ThreadPool(size_t threads)
+    :   stop(false)
+{
+    for(size_t i = 0;i<threads;++i)
+        workers.emplace_back(
+            [this]
+            {
+                for(;;)
+                {
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock,
+                                             [this]{ return this->stop || !this->tasks.empty(); });
+                        if(this->stop && this->tasks.empty())
+                            return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+
+                    task();
+                }
+            }
+            );
+}
+
+// add new work item to the pool
+template<class F, class... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args)
+    -> std::future<typename std::result_of<F(Args...)>::type>
+{
+    using return_type = typename std::result_of<F(Args...)>::type;
+
+    auto task = std::make_shared< std::packaged_task<return_type()> >(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+
+    std::future<return_type> res = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+
+        // don't allow enqueueing after stopping the pool
+        if(stop)
+            throw std::runtime_error("enqueue on stopped ThreadPool");
+
+        tasks.emplace([task](){ (*task)(); });
+    }
+    condition.notify_one();
+    return res;
+}
+
+// the destructor joins all threads
+inline ThreadPool::~ThreadPool()
+{
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for(std::thread &worker: workers)
+        worker.join();
+}
+
 
 namespace GC{
 
@@ -14,14 +107,12 @@ double const PI = std::acos(-1);
 double constexpr EPS = 1e-9;
 double const term1 = 1.0/std::pow((2.0*PI), 3.0/2.0); // 多元正态分布的一个因子
 
-enum
-{
-    BGD    = 0,  // 肯定是背景
-    FGD    = 1,  // 肯定是前景
-    MAY_BGD = 2,  // 更可能是背景
-    MAY_FGD = 3   // 更可能是前景
-};
-
+unsigned long const min_per_thread=500;
+unsigned long max_threads(unsigned long length){return (length+min_per_thread-1)/min_per_thread;}
+unsigned long const hardware_threads = std::thread::hardware_concurrency();
+unsigned long num_threads(unsigned long length){return std::min(hardware_threads != 0 ? hardware_threads : 2, max_threads(length));}
+ThreadPool thdp(hardware_threads!=0?hardware_threads:2);
+//ThreadPool thdp(4);
 
 inline double vTMv33(double const * vt, double const * m, double const * v){
     return vt[0]*(v[0]*m[0]+v[1]*m[1]+v[2]*m[2])
@@ -68,20 +159,19 @@ public:
     GMM(){
         // 混合参数1位，RGB三通道的均值3位，其协方差矩阵3x3即9位
         // TODO: 初始化疑似可以优化
-        cv::Vec3d zv(0.0, 0.0, 0.0);
         std::fill(coefs, coefs+K, 0.0);
-        std::fill(mean, mean+K, zv);
-        std::fill(cov, cov+K, cv::Matx33d::zeros());
-
         std::fill(covDet, covDet+K, 0.0);
-        std::fill(covInv, covInv+K, cv::Matx33d::zeros());
         std::fill(covDetSqrtInv, covDetSqrtInv+K, 0.0);
-
         std::fill(sampleCnt, sampleCnt+K, 0);
         totalSampleCnt = 0;
 
-        std::fill(colorSum, colorSum+K, zv);
-        std::fill(colorProdSum, colorProdSum+K, cv::Matx33d::zeros());
+        for(int i=0;i<K;i++){
+            std::fill(mean[i].val, mean[i].val+3, 0.0);
+            std::fill(cov[i].val, cov[i].val+9, 0.0);
+            std::fill(covInv[i].val, covInv[i].val+9, 0.0);
+            std::fill(colorSum[i].val, colorSum[i].val+3, 0.0);
+            std::fill(colorProdSum[i].val, colorProdSum[i].val+9, 0.0);
+        }
     }
 
     double possibility(int ki, cv::Vec3d const & color) const {
@@ -178,6 +268,14 @@ public:
             calcCovInvAndDet(ki);
         }
     }
+};
+
+enum
+{
+    BGD    = 0,  // 肯定是背景
+    FGD    = 1,  // 肯定是前景
+    MAY_BGD = 2,  // 更可能是背景
+    MAY_FGD = 3   // 更可能是前景
 };
 
 std::vector<uint8_t> kMeans(std::vector<cv::Vec3d> const & colors, int classNum=GMM::K, int iterCnt = 10){
@@ -292,9 +390,9 @@ private:
 
         auto maskEqu = [&mask](int i1, int j1, int i2, int j2){
             return true;
-//            int mk1 = mask.at<int>(i1,j1), mk2 = mask.at<int>(i2,j2);
-//            if(mk1>1||mk2>1) return true;
-//            return mk1 != mk2;
+            //            int mk1 = mask.at<int>(i1,j1), mk2 = mask.at<int>(i2,j2);
+            //            if(mk1>1||mk2>1) return true;
+            //            return mk1 != mk2;
             // 经过测试，原文中说的艾弗森括号[alpha_n != alpha_m]，无论以什么角度去理解，都不如直接全部返回true
             // 比较怀疑是因为这里是软segmentation，大家的alpha都不一样，所以干脆全部返回true
         };
@@ -304,8 +402,8 @@ private:
         auto calcWeight = [&img, &beta, &gamma](int i1, int j1, int i2, int j2){
             cv::Vec3d color = img.at<cv::Vec3b>(i1, j1);
             cv::Vec3d delta = color - static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i2, j2));
-//            if(std::abs(i1-i2)+std::abs(j1-j2)==2)
-//                return gamma/std::sqrt(2)*cv::exp(-beta*delta.dot(delta)); // 即dis^-1
+            //            if(std::abs(i1-i2)+std::abs(j1-j2)==2)
+            //                return gamma/std::sqrt(2)*cv::exp(-beta*delta.dot(delta)); // 即dis^-1
             return gamma*cv::exp(-beta*vTv3(delta.val, delta.val));
         };
 
@@ -364,8 +462,8 @@ private:
                 cv::Vec3d color = img.at<cv::Vec3b>(i, j);
                 uint8_t mk = mask.at<uint8_t>(i, j);
                 if(mk==MAY_FGD || mk==MAY_BGD){
-                    sw = -std::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是前景
-                    tw = -std::log(fgdGMM.possibility(color)); // 汇点那边是背景。
+                    sw = -cv::log(bgdGMM.possibility(color)); // graph cut的论文指出，源点那边是前景
+                    tw = -cv::log(fgdGMM.possibility(color)); // 汇点那边是背景。
                     // 这里是惩罚项（正数），即分类错误的惩罚。我们需要使惩罚最小，能量最小
                     // grab cut的论文虽然说的是和k_n有关，但经过测试发现，没有k_n，而是所有概率加和的惩罚项明显更好
                     // 即，不使用-cv::log(bgdGMM.possibility(ki, color))
@@ -466,15 +564,30 @@ void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& fgdGMM, GMM& bgdGM
 }
 
 void assignGMMsToPixels(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, cv::Mat& PixToComp){
-    for(int i=0;i<img.rows;i++){
-        for(int j=0;j<img.cols;j++){
-            if(mask.at<uint8_t>(i,j)&1){
-                PixToComp.at<uint8_t>(i,j) = fgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
-            }
-            else{
-                PixToComp.at<uint8_t>(i,j) = bgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
-            }
-        }
+    unsigned long threadCnt = num_threads(img.rows*img.cols);
+    unsigned long rowsPerThread = img.rows/threadCnt;
+    std::vector<std::future<bool> > finished;
+
+    for(int T=0;T<threadCnt;T++){
+        finished.emplace_back(
+            thdp.enqueue([&](int Tnum)->bool{
+                for(int i=Tnum*rowsPerThread;i<(Tnum+1)*rowsPerThread&&i<img.rows;i++){
+                    for(int j=0;j<img.cols;j++){
+                        if(mask.at<uint8_t>(i,j)&1){
+                            PixToComp.at<uint8_t>(i,j) = fgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+                        }
+                        else{
+                            PixToComp.at<uint8_t>(i,j) = bgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+                        }
+                    }
+                }
+                return true;
+            }, T)
+        );
+    }
+
+    for(int T=0;T<threadCnt;T++){
+        finished[T].wait();
     }
 }
 
@@ -498,8 +611,8 @@ void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bg
     bgdGMM.calcMeanAndCovWithSamples();
 }
 
-void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20){
-    GMM fgdGMM, bgdGMM;
+void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=true){
+    static GMM fgdGMM, bgdGMM;
     GCGraph gcg(img.rows*img.cols, img.rows*img.cols*8);
     cv::Mat PixToComp;
     PixToComp.create(img.size(), CV_8UC1);
@@ -508,10 +621,12 @@ void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20){
 
     double const beta = calcBeta(img);
 
-    initGMMs(img, mask, fgdGMM, bgdGMM);
-
+    if(init){
+        fgdGMM.deleteAllSamples();
+        bgdGMM.deleteAllSamples();
+        initGMMs(img, mask, fgdGMM, bgdGMM);
+    }
     while(iterCnt--){
-        std::cout<<"left iter cnt: "<<iterCnt<<std::endl;
         assignGMMsToPixels(img, mask, fgdGMM, bgdGMM, PixToComp);
         learnGMMs(img, mask, fgdGMM, bgdGMM, PixToComp);
         gcg.buildGraph(img, mask, fgdGMM, bgdGMM, beta);
@@ -520,6 +635,236 @@ void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20){
 }
 
 } // namespace GC
+
+namespace GCGUI{
+//class GUI{
+//private:
+//    bool hasRect=0, hasFgdBrush=0, hasBgdBursh=0;
+//    std::vector<cv::Point> fgdPts, bgdPts;
+//    std::string windowName;
+//    cv::Mat const & img;
+//public:
+//    GUI(std::string const & windowName_, cv::Mat const & img_):windowName(windowName_), img(img_){}
+//};
+
+class GUI{
+public:
+//    cv::Scalar const BLACK = cv::Scalar(0, 0, 0);
+//    cv::Scalar const WHITE = cv::Scalar(255, 255, 255);
+    cv::Scalar const RED = cv::Scalar(0, 0, 255);
+
+    cv::Rect rect;
+    bool hasRect = 0;
+    bool mouseDown = 0;
+    cv::Mat mask;
+    cv::Mat initImg;
+    cv::Mat editingImg;
+    std::string windowName;
+//    std::vector<cv::Point> fgdPts, bgdPts;
+    int toolType = 0;
+public:
+    auto showImg()->void{
+        cv::Mat res;
+        res.create(editingImg.size(), CV_8UC1);
+        editingImg.copyTo(res);
+//        for(auto const & pt:fgdPts){
+//            cv::circle(res, pt, 2, WHITE, -1);
+//        }
+//        for(auto const & pt:bgdPts){
+//            cv::circle(res, pt, 2, BLACK, -1);
+//        }
+        if(hasRect){
+            cv::rectangle(res, cv::Point(rect.x, rect.y), cv::Point(rect.x+rect.width, rect.y+rect.height), RED, 2);
+        }
+        cv::imshow(windowName, res);
+    }
+
+    auto mouseHandle(int event, int x, int y, int flags, void* param)->void{
+        if(toolType==1){
+            rectTool(event, x, y, flags, param);
+        }
+        if(toolType==2){
+            fgdTool(event, x, y, flags, param);
+        }
+        if(toolType==3){
+            bgdTool(event, x, y, flags, param);
+        }
+    }
+
+    auto PointToValid(int x, int y, bool inRect)->cv::Point{
+        x = std::max(0, x);
+        y = std::max(0, y);
+        x = std::min(initImg.size().width-1, x);
+        y = std::min(initImg.size().height-1, y);
+        if(inRect){
+            assert(hasRect);
+            x = std::max(rect.x, x);
+            y = std::max(rect.y, y);
+            x = std::min(rect.x+rect.width-1, x);
+            y = std::min(rect.y+rect.height-1, y);
+        }
+        return cv::Point(x, y);
+    }
+
+    auto PointToValid(cv::Point po, bool inRect)->cv::Point{
+        return PointToValid(po.x, po.y, inRect);
+    }
+
+    auto rectTool(int event, int x, int y, int flags, void* param)->void{
+        if(event==CV_EVENT_LBUTTONDOWN && !hasRect){
+            mouseDown = 1;
+            hasRect = 1;
+            cv::Point po = PointToValid(x, y, 0);
+            rect = cv::Rect(po.x, po.y, 1, 1);
+        }
+        else if(event==CV_EVENT_LBUTTONUP && mouseDown){
+            rect = cv::Rect(PointToValid(cv::Point(rect.x, rect.y), 0), PointToValid(cv::Point(x, y), 0));
+            mouseDown = 0;
+            GC::initMask(mask, editingImg.size(), rect);
+        }
+        else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
+            rect = cv::Rect(PointToValid(cv::Point(rect.x, rect.y), 0), PointToValid(cv::Point(x, y), 0));
+            showImg();
+        }
+    };
+
+    auto brushAssign(int x, int y, uint8_t msk)->void{
+        for(int i=-2;i<=2;i++){
+            for(int j=-2;j<=2;j++){
+                cv::Point po = PointToValid(x+i, y+j, 1);
+                if(msk&1) editingImg.at<cv::Vec3b>(po) = initImg.at<cv::Vec3b>(po);
+                else      editingImg.at<cv::Vec3b>(po) = cv::Vec3b(0,0,0);
+                mask.at<uint8_t>(po) = msk;
+            }
+        }
+    }
+
+    auto fgdTool(int event, int x, int y, int flags, void* param)->void{
+        if(event==CV_EVENT_LBUTTONDOWN){
+            assert(hasRect);
+            mouseDown = 1;
+//            fgdPts.push_back(cv::Point(x, y));
+
+        }
+        else if(event==CV_EVENT_LBUTTONUP && mouseDown){
+            assert(hasRect);
+            mouseDown = 0;
+//            fgdPts.push_back(cv::Point(x, y));
+            brushAssign(x, y, GC::FGD);
+        }
+        else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
+            assert(hasRect);
+//            fgdPts.push_back(cv::Point(x, y));
+            brushAssign(x, y, GC::FGD);
+            showImg();
+        }
+    };
+
+    auto bgdTool(int event, int x, int y, int flags, void* param)->void{
+        if(event==CV_EVENT_LBUTTONDOWN){
+            assert(hasRect);
+            mouseDown = 1;
+//            bgdPts.push_back(cv::Point(x, y));
+            brushAssign(x, y, GC::BGD);
+        }
+        else if(event==CV_EVENT_LBUTTONUP && mouseDown){
+            assert(hasRect);
+            mouseDown = 0;
+//            bgdPts.push_back(cv::Point(x, y));
+            brushAssign(x, y, GC::BGD);
+        }
+        else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
+            assert(hasRect);
+//            bgdPts.push_back(cv::Point(x, y));
+            brushAssign(x, y, GC::BGD);
+            showImg();
+        }
+    };
+}gui;
+
+auto mouseHandle(int event, int x, int y, int flags, void* param)->void{
+    gui.mouseHandle(event, x, y, flags, param);
+}
+
+void gui_main(cv::Mat const & img){
+    std::cout<<"工具：1矩形、2前景刷、3背景刷\n";
+    std::cout<<"操作：q退出并保存，s进行图像处理，r重置\n";
+
+    gui.windowName = "grab cut";
+    cv::namedWindow(gui.windowName, CV_WINDOW_AUTOSIZE);
+    gui.editingImg.create(img.size(), CV_8UC1);
+    img.copyTo(gui.editingImg);
+    gui.initImg.create(img.size(), CV_8UC1);
+    img.copyTo(gui.initImg);
+
+    cv::setMouseCallback(gui.windowName, mouseHandle);
+
+    bool init = true;
+
+    gui.showImg();
+    while(true){
+        int key = cv::waitKey();
+        if(key=='1'){
+            gui.toolType = 1;
+        }
+        else if(key=='2'){
+            if(!gui.hasRect){
+                std::cout<<"should draw a rect first\n";
+                continue;
+            }
+            gui.toolType = 2;
+        }
+        else if(key=='3'){
+            if(!gui.hasRect){
+                std::cout<<"should draw a rect first\n";
+                continue;
+            }
+            gui.toolType = 3;
+        }
+        else if(key=='q'){
+            cv::imwrite("result.jpg", gui.editingImg);
+            break;
+        }
+        else if(key=='s'){
+            if(!gui.hasRect){
+                std::cout<<"should draw a rect first\n";
+                continue;
+            }
+
+            auto start = std::chrono::high_resolution_clock::now();
+            if(init) GC::grabCut(img, gui.mask, 5, init), init=false;
+            else GC::grabCut(img, gui.mask, 1, init);
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            std::cout << duration << "ms" << std::endl;
+
+            for(int i=0;i<gui.editingImg.rows;i++){
+                for(int j=0;j<gui.editingImg.cols;j++){
+                    uint8_t const mk = gui.mask.at<uint8_t>(i, j);
+                    if(mk&1){
+                        gui.editingImg.at<cv::Vec3b>(i, j) = img.at<cv::Vec3b>(i, j);
+                    }
+                    else{
+                        gui.editingImg.at<cv::Vec3b>(i, j) = cv::Vec3b(0,0,0);
+                    }
+                }
+            }
+//            gui.fgdPts.clear();
+//            gui.bgdPts.clear();
+        }
+        else if(key=='r'){
+            img.copyTo(gui.editingImg);
+            gui.hasRect = 0;
+            init = 1;
+//            gui.fgdPts.clear();
+//            gui.bgdPts.clear();
+        }
+        gui.showImg();
+    }
+
+    cv::destroyWindow(gui.windowName);
+}
+} // namespace GCGUI
 
 #endif
 
