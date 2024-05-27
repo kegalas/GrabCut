@@ -14,6 +14,7 @@
 #include <queue>
 #include <functional>
 #include <atomic>
+#include <cstring>
 
 class ThreadPool {
     // https://github.com/progschj/ThreadPool/blob/master/ThreadPool.h
@@ -185,7 +186,7 @@ public:
         double mult = -0.5 * m;
 
         ret = term1;
-        ret *= covDetSqrtInv[ki];
+        ret = ret * covDetSqrtInv[ki];
         ret *= cv::exp(mult);
 
         return ret;
@@ -267,6 +268,46 @@ public:
 
             calcCovInvAndDet(ki);
         }
+    }
+};
+
+class Histogram{
+private:
+    using dataType = std::array<uint8_t, 3>;
+    int cnt[256][256][256];
+    size_t totalCnt;
+public:
+    Histogram():cnt(){
+        std::memset(cnt, 0, sizeof(cnt));
+        totalCnt = 0;
+    }
+
+    double possibility(cv::Vec3d const & color, int delta=10) const {
+        if(totalCnt==0) return 0.0;
+        cv::Vec3b c = color;
+        double sum = 0.0;
+        for(int i=-delta;i<=delta;i++){
+            for(int j=-delta;j<=delta;j++){
+                for(int k=-delta;k<=delta;k++){
+                    int x = c[0]+i, y=c[1]+j, z=c[2]+k;
+                    if(x<0||y<0||z<0||x>255||y>255||z>255) continue;
+                    sum += cnt[x][y][z];
+                }
+            }
+        }
+
+        return sum/totalCnt;
+    }
+
+    void addSample(cv::Vec3d const & color){
+        cv::Vec3b c = color;
+        cnt[c[0]][c[1]][c[2]]++;
+        totalCnt++;
+    }
+
+    void deleteAllSamples(){
+        std::memset(cnt, 0, sizeof(cnt));
+        totalCnt = 0;
     }
 };
 
@@ -483,6 +524,43 @@ private:
         }
     }
 
+    void addTLinks(cv::Mat const & img, cv::Mat const & mask, Histogram const & fgdHis, Histogram const & bgdHis){
+        // 传入图像和mask
+        // 添加数据项，即图上的像素到源点汇点的边权，似乎在graph cut的论文里叫t weights、t links
+
+        auto coordToIdx = [&img](int i, int j){
+            return i*img.cols+j;
+        };
+        double const eta = 1000.0;
+
+        for(int i=0;i<img.rows;i++){
+            for(int j=0;j<img.cols;j++){
+                double sw, tw; // 到源点的权值，到汇点的权值
+
+                cv::Vec3d color = img.at<cv::Vec3b>(i, j);
+                uint8_t mk = mask.at<uint8_t>(i, j);
+                if(mk==MAY_FGD || mk==MAY_BGD){
+                    sw = -cv::log(bgdHis.possibility(color))*eta; // graph cut的论文指出，源点那边是前景
+                    tw = -cv::log(fgdHis.possibility(color))*eta; // 汇点那边是背景。
+                    // 这里是惩罚项（正数），即分类错误的惩罚。我们需要使惩罚最小，能量最小
+                    // grab cut的论文虽然说的是和k_n有关，但经过测试发现，没有k_n，而是所有概率加和的惩罚项明显更好
+                    // 即，不使用-cv::log(bgdGMM.possibility(ki, color))
+                }
+                //                else continue;
+                else if(mk==FGD){
+                    sw = kTerm; // 见graph cut论文，这一部分没有在grab cut中提到
+                    tw = 0;     // 但是我测试过后，神奇地发现直接去掉也可以
+                }
+                else{
+                    sw = 0;
+                    tw = kTerm;
+                }
+
+                g->add_tweights(coordToIdx(i, j), sw, tw);
+            }
+        }
+    }
+
 public:
     GCGraph(int nodeNumMax_, int edgeNumMax_):  g(std::make_unique<GraphType>(nodeNumMax_, edgeNumMax_)),
                                                 kTerm(0.0){}
@@ -496,6 +574,14 @@ public:
 
         addNLinks(img, mask, beta, gamma);
         addTLinks(img, mask, fgdGMM, bgdGMM);
+    }
+
+    void buildGraph(cv::Mat const & img, cv::Mat const & mask, Histogram const & fgdHis, Histogram const & bgdHis, double beta, double gamma = 50.0){
+        g->reset();
+        kTerm = 0.0;
+
+        addNLinks(img, mask, beta, gamma);
+        addTLinks(img, mask, fgdHis, bgdHis);
     }
 
     void estimateSegmentation(cv::Mat & mask){
@@ -563,32 +649,74 @@ void initGMMs(cv::Mat const & img, cv::Mat const & mask, GMM& fgdGMM, GMM& bgdGM
     bgdGMM.calcMeanAndCovWithSamples();
 }
 
+void initHistograms(cv::Mat const & img, cv::Mat const & mask, Histogram& fgdHis, Histogram& bgdHis){
+    // 使用K-means算法把BGD和FGB各自的初始节点分为K类，然后放到对应的GMM分量中
+    std::vector<cv::Vec3d> bgdSamples, fgdSamples;
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            if(mask.at<uint8_t>(i,j)&1){
+                fgdSamples.push_back(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+            else{
+                bgdSamples.push_back(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
+            }
+        }
+    }
+
+    fgdHis.deleteAllSamples();
+    for(int i=0, sz=fgdSamples.size();i<sz;i++){
+        fgdHis.addSample(fgdSamples[i]);
+    }
+
+    bgdHis.deleteAllSamples();
+    for(int i=0, sz=bgdSamples.size();i<sz;i++){
+        bgdHis.addSample(bgdSamples[i]);
+    }
+}
+
 void assignGMMsToPixels(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, cv::Mat& PixToComp){
-    unsigned long threadCnt = num_threads(img.rows*img.cols);
-    unsigned long rowsPerThread = img.rows/threadCnt;
-    std::vector<std::future<bool> > finished;
+//    unsigned long threadCnt = num_threads(img.rows*img.cols);
+//    unsigned long rowsPerThread = img.rows/threadCnt;
+//    std::vector<std::future<bool> > finished;
+//    volatile uint8_t * const px1 = PixToComp.ptr<uint8_t>(0);
+//    cv::Vec3b const * const px2 = img.ptr<cv::Vec3b>(0);
+//    for(int T=0;T<threadCnt;T++){
+//        finished.emplace_back(
+//            thdp.enqueue([&](int Tnum)->bool{
+//                for(int i=Tnum*rowsPerThread;i<(Tnum+1)*rowsPerThread&&i<img.rows;i++){
+//                    for(int j=0;j<img.cols;j++){
+//                        if(mask.at<uint8_t>(i,j)&1){
+//                            px1[i*img.cols+j] = fgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+//                        }
+//                        else{
+//                            px1[i*img.cols+j] = bgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+//                        }
+//                    }
+//                }
+//                return true;
+//            }, T)
+//        );
+//    }
 
-    for(int T=0;T<threadCnt;T++){
-        finished.emplace_back(
-            thdp.enqueue([&](int Tnum)->bool{
-                for(int i=Tnum*rowsPerThread;i<(Tnum+1)*rowsPerThread&&i<img.rows;i++){
-                    for(int j=0;j<img.cols;j++){
-                        if(mask.at<uint8_t>(i,j)&1){
-                            PixToComp.at<uint8_t>(i,j) = fgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
-                        }
-                        else{
-                            PixToComp.at<uint8_t>(i,j) = bgdGMM.whichComponent(static_cast<cv::Vec3d>(img.at<cv::Vec3b>(i,j)));
-                        }
-                    }
-                }
-                return true;
-            }, T)
-        );
+//    for(int T=0;T<threadCnt;T++){
+//        finished[T].wait();
+//    }
+
+    for(int i=0;i<img.rows;i++){
+        for(int j=0;j<img.cols;j++){
+            if(mask.at<uint8_t>(i,j)&1){
+                uint8_t* px1 = PixToComp.ptr<uint8_t>(0);
+                cv::Vec3b const * px2 = img.ptr<cv::Vec3b>(0);
+                px1[i*img.cols+j] = fgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+            }
+            else{
+                uint8_t* px1 = PixToComp.ptr<uint8_t>(0);
+                cv::Vec3b const * px2 = img.ptr<cv::Vec3b>(0);
+                px1[i*img.cols+j] = bgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+            }
+        }
     }
 
-    for(int T=0;T<threadCnt;T++){
-        finished[T].wait();
-    }
 }
 
 void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bgdGMM, cv::Mat const & PixToComp){
@@ -634,24 +762,28 @@ void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=tr
     }
 }
 
+void grabCutHistogram(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=true){
+    static Histogram fgdHis, bgdHis;
+    GCGraph gcg(img.rows*img.cols, img.rows*img.cols*8);
+    assert(img.type()==CV_8UC3);
+    assert(mask.type()==CV_8UC1);
+
+    double const beta = calcBeta(img);
+
+    while(iterCnt--){
+        initHistograms(img, mask, fgdHis, bgdHis);
+        gcg.buildGraph(img, mask, fgdHis, bgdHis, beta);
+        gcg.estimateSegmentation(mask);
+    }
+}
+
 } // namespace GC
 
 namespace GCGUI{
-//class GUI{
-//private:
-//    bool hasRect=0, hasFgdBrush=0, hasBgdBursh=0;
-//    std::vector<cv::Point> fgdPts, bgdPts;
-//    std::string windowName;
-//    cv::Mat const & img;
-//public:
-//    GUI(std::string const & windowName_, cv::Mat const & img_):windowName(windowName_), img(img_){}
-//};
 
 class GUI{
 public:
-//    cv::Scalar const BLACK = cv::Scalar(0, 0, 0);
-//    cv::Scalar const WHITE = cv::Scalar(255, 255, 255);
-    cv::Scalar const RED = cv::Scalar(0, 0, 255);
+    cv::Scalar const BLUE = cv::Scalar(255, 0, 0);
 
     cv::Rect rect;
     bool hasRect = 0;
@@ -660,21 +792,14 @@ public:
     cv::Mat initImg;
     cv::Mat editingImg;
     std::string windowName;
-//    std::vector<cv::Point> fgdPts, bgdPts;
     int toolType = 0;
 public:
     auto showImg()->void{
         cv::Mat res;
         res.create(editingImg.size(), CV_8UC1);
         editingImg.copyTo(res);
-//        for(auto const & pt:fgdPts){
-//            cv::circle(res, pt, 2, WHITE, -1);
-//        }
-//        for(auto const & pt:bgdPts){
-//            cv::circle(res, pt, 2, BLACK, -1);
-//        }
         if(hasRect){
-            cv::rectangle(res, cv::Point(rect.x, rect.y), cv::Point(rect.x+rect.width, rect.y+rect.height), RED, 2);
+            cv::rectangle(res, cv::Point(rect.x, rect.y), cv::Point(rect.x+rect.width, rect.y+rect.height), BLUE, 2);
         }
         cv::imshow(windowName, res);
     }
@@ -684,10 +809,16 @@ public:
             rectTool(event, x, y, flags, param);
         }
         if(toolType==2){
-            fgdTool(event, x, y, flags, param);
+            fgdHardTool(event, x, y, flags, param);
         }
         if(toolType==3){
-            bgdTool(event, x, y, flags, param);
+            bgdHardTool(event, x, y, flags, param);
+        }
+        if(toolType==4){
+            fgdSoftTool(event, x, y, flags, param);
+        }
+        if(toolType==5){
+            bgdSoftTool(event, x, y, flags, param);
         }
     }
 
@@ -739,44 +870,74 @@ public:
         }
     }
 
-    auto fgdTool(int event, int x, int y, int flags, void* param)->void{
+    auto fgdHardTool(int event, int x, int y, int flags, void* param)->void{
         if(event==CV_EVENT_LBUTTONDOWN){
             assert(hasRect);
             mouseDown = 1;
-//            fgdPts.push_back(cv::Point(x, y));
-
+            brushAssign(x, y, GC::FGD);
         }
         else if(event==CV_EVENT_LBUTTONUP && mouseDown){
             assert(hasRect);
             mouseDown = 0;
-//            fgdPts.push_back(cv::Point(x, y));
             brushAssign(x, y, GC::FGD);
         }
         else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
             assert(hasRect);
-//            fgdPts.push_back(cv::Point(x, y));
             brushAssign(x, y, GC::FGD);
             showImg();
         }
     };
 
-    auto bgdTool(int event, int x, int y, int flags, void* param)->void{
+    auto bgdHardTool(int event, int x, int y, int flags, void* param)->void{
         if(event==CV_EVENT_LBUTTONDOWN){
             assert(hasRect);
             mouseDown = 1;
-//            bgdPts.push_back(cv::Point(x, y));
             brushAssign(x, y, GC::BGD);
         }
         else if(event==CV_EVENT_LBUTTONUP && mouseDown){
             assert(hasRect);
             mouseDown = 0;
-//            bgdPts.push_back(cv::Point(x, y));
             brushAssign(x, y, GC::BGD);
         }
         else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
             assert(hasRect);
-//            bgdPts.push_back(cv::Point(x, y));
             brushAssign(x, y, GC::BGD);
+            showImg();
+        }
+    };
+
+    auto fgdSoftTool(int event, int x, int y, int flags, void* param)->void{
+        if(event==CV_EVENT_LBUTTONDOWN){
+            assert(hasRect);
+            mouseDown = 1;
+            brushAssign(x, y, GC::MAY_FGD);
+        }
+        else if(event==CV_EVENT_LBUTTONUP && mouseDown){
+            assert(hasRect);
+            mouseDown = 0;
+            brushAssign(x, y, GC::MAY_FGD);
+        }
+        else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
+            assert(hasRect);
+            brushAssign(x, y, GC::MAY_FGD);
+            showImg();
+        }
+    };
+
+    auto bgdSoftTool(int event, int x, int y, int flags, void* param)->void{
+        if(event==CV_EVENT_LBUTTONDOWN){
+            assert(hasRect);
+            mouseDown = 1;
+            brushAssign(x, y, GC::MAY_BGD);
+        }
+        else if(event==CV_EVENT_LBUTTONUP && mouseDown){
+            assert(hasRect);
+            mouseDown = 0;
+            brushAssign(x, y, GC::MAY_BGD);
+        }
+        else if(event==CV_EVENT_MOUSEMOVE && mouseDown){
+            assert(hasRect);
+            brushAssign(x, y, GC::MAY_BGD);
             showImg();
         }
     };
@@ -787,7 +948,7 @@ auto mouseHandle(int event, int x, int y, int flags, void* param)->void{
 }
 
 void gui_main(cv::Mat const & img){
-    std::cout<<"工具：1矩形、2前景刷、3背景刷\n";
+    std::cout<<"工具：1矩形、2前景硬刷、3背景硬刷、4前景软刷、5背景软刷\n";
     std::cout<<"操作：q退出并保存，s进行图像处理，r重置\n";
 
     gui.windowName = "grab cut";
@@ -821,6 +982,20 @@ void gui_main(cv::Mat const & img){
             }
             gui.toolType = 3;
         }
+        else if(key=='4'){
+            if(!gui.hasRect){
+                std::cout<<"should draw a rect first\n";
+                continue;
+            }
+            gui.toolType = 4;
+        }
+        else if(key=='5'){
+            if(!gui.hasRect){
+                std::cout<<"should draw a rect first\n";
+                continue;
+            }
+            gui.toolType = 5;
+        }
         else if(key=='q'){
             cv::imwrite("result.jpg", gui.editingImg);
             break;
@@ -832,7 +1007,7 @@ void gui_main(cv::Mat const & img){
             }
 
             auto start = std::chrono::high_resolution_clock::now();
-            if(init) GC::grabCut(img, gui.mask, 5, init), init=false;
+            if(init) {GC::grabCut(img, gui.mask, 5, init);init=false;}
             else GC::grabCut(img, gui.mask, 1, init);
             auto end = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -849,15 +1024,11 @@ void gui_main(cv::Mat const & img){
                     }
                 }
             }
-//            gui.fgdPts.clear();
-//            gui.bgdPts.clear();
         }
         else if(key=='r'){
             img.copyTo(gui.editingImg);
             gui.hasRect = 0;
             init = 1;
-//            gui.fgdPts.clear();
-//            gui.bgdPts.clear();
         }
         gui.showImg();
     }
