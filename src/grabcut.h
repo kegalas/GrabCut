@@ -269,6 +269,15 @@ public:
             calcCovInvAndDet(ki);
         }
     }
+
+    void visualOutput(std::string const & filename) const {
+        cv::Mat img = cv::Mat::zeros(300, 600, CV_8UC3);
+        int sz = 600/(K+2);
+        for(int i=1;i<sz-1&&i<=K;i++){
+            cv::circle(img, cv::Point(i*sz,150), 50, cv::Scalar(cv::Vec3b(mean[i-1])), -50);
+        }
+        cv::imwrite(filename, img);
+    }
 };
 
 class Histogram{
@@ -739,7 +748,7 @@ void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bg
     bgdGMM.calcMeanAndCovWithSamples();
 }
 
-void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=true){
+void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=true, bool extra=false){
     static GMM fgdGMM, bgdGMM;
     GCGraph gcg(img.rows*img.cols, img.rows*img.cols*8);
     cv::Mat PixToComp;
@@ -759,6 +768,32 @@ void grabCut(cv::Mat const & img, cv::Mat & mask, int iterCnt = 20, bool init=tr
         learnGMMs(img, mask, fgdGMM, bgdGMM, PixToComp);
         gcg.buildGraph(img, mask, fgdGMM, bgdGMM, beta);
         gcg.estimateSegmentation(mask);
+    }
+
+    if(extra){
+        cv::Mat maskOutput;
+        maskOutput.create(img.size(), CV_8UC3);
+
+        for(int i=0;i<maskOutput.rows;i++){
+            for(int j=0;j<maskOutput.cols;j++){
+                uint8_t msk = mask.at<uint8_t>(i, j);
+                if(msk==FGD){
+                    maskOutput.at<cv::Vec3b>(i,j) = cv::Vec3b(255,255,255);
+                }
+                else if(msk==MAY_FGD){
+                    maskOutput.at<cv::Vec3b>(i,j) = cv::Vec3b(0,0,255);
+                }
+                else if(msk==MAY_BGD){
+                    maskOutput.at<cv::Vec3b>(i,j) = cv::Vec3b(255,0,0);
+                }
+                else{
+                    maskOutput.at<cv::Vec3b>(i,j) = cv::Vec3b(0,0,0);
+                }
+            }
+        }
+        cv::imwrite("mask.jpg", maskOutput);
+        fgdGMM.visualOutput("fgdGMM.jpg");
+        bgdGMM.visualOutput("bgdGMM.jpg");
     }
 }
 
@@ -947,7 +982,7 @@ auto mouseHandle(int event, int x, int y, int flags, void* param)->void{
     gui.mouseHandle(event, x, y, flags, param);
 }
 
-void gui_main(cv::Mat const & img){
+void gui_main(cv::Mat const & img, bool extra = false){
     std::cout<<"工具：1矩形、2前景硬刷、3背景硬刷、4前景软刷、5背景软刷\n";
     std::cout<<"操作：q退出并保存，s进行图像处理，r重置\n";
 
@@ -1007,8 +1042,8 @@ void gui_main(cv::Mat const & img){
             }
 
             auto start = std::chrono::high_resolution_clock::now();
-            if(init) {GC::grabCut(img, gui.mask, 5, init);init=false;}
-            else GC::grabCut(img, gui.mask, 1, init);
+            if(init) {GC::grabCut(img, gui.mask, 5, init, extra);init=false;}
+            else GC::grabCut(img, gui.mask, 1, init, extra);
             auto end = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
             std::cout << duration << "ms" << std::endl;

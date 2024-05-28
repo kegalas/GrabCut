@@ -5,7 +5,7 @@
 #include <chrono>
 
 int main(int argc, char* argv[]) {
-    if(argc!=2){
+    if(argc!=2 && argc!=3){
         std::cout<<"usage: GrabCut.exe image_filename";
         return 0;
     }
@@ -17,12 +17,15 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    bool extra = 0;
+    if(argc==3 && std::string(argv[2])=="-extra") extra = 1;
+
     cv::Size sz;
     sz.height = img.rows/2;
     sz.width = img.cols/2;
     cv::resize(img, img, sz);
 
-    GCGUI::gui_main(img);
+    GCGUI::gui_main(img, extra);
 
     return 0;
 }

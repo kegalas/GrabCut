@@ -1,9 +1,9 @@
 # GrabCut
 my implementation of grabcut
 
-尚未完成，处于正在开发的过程中。
+除了border matting都完成了，后续可能会更新这部分。
 
-后续会在个人博客更新论文精读和实现指南。
+个人博客的论文精读和实现指南：[https://kegalas.top/p/grabcut-interactive-foreground-extraction-using-iterated-graph-cuts%E8%AE%BA%E6%96%87%E7%B2%BE%E8%AF%BB%E4%B8%8E%E5%A4%8D%E7%8E%B0/](https://kegalas.top/p/grabcut-interactive-foreground-extraction-using-iterated-graph-cuts%E8%AE%BA%E6%96%87%E7%B2%BE%E8%AF%BB%E4%B8%8E%E5%A4%8D%E7%8E%B0/)
 
 原论文：[https://www.microsoft.com/en-us/research/publication/grabcut-interactive-foreground-extraction-using-iterated-graph-cuts/](https://www.microsoft.com/en-us/research/publication/grabcut-interactive-foreground-extraction-using-iterated-graph-cuts/)
 
