@@ -684,48 +684,33 @@ void initHistograms(cv::Mat const & img, cv::Mat const & mask, Histogram& fgdHis
 }
 
 void assignGMMsToPixels(cv::Mat const & img, cv::Mat const & mask, GMM const & fgdGMM, GMM const & bgdGMM, cv::Mat& PixToComp){
-//    unsigned long threadCnt = num_threads(img.rows*img.cols);
-//    unsigned long rowsPerThread = img.rows/threadCnt;
-//    std::vector<std::future<bool> > finished;
-//    volatile uint8_t * const px1 = PixToComp.ptr<uint8_t>(0);
-//    cv::Vec3b const * const px2 = img.ptr<cv::Vec3b>(0);
-//    for(int T=0;T<threadCnt;T++){
-//        finished.emplace_back(
-//            thdp.enqueue([&](int Tnum)->bool{
-//                for(int i=Tnum*rowsPerThread;i<(Tnum+1)*rowsPerThread&&i<img.rows;i++){
-//                    for(int j=0;j<img.cols;j++){
-//                        if(mask.at<uint8_t>(i,j)&1){
-//                            px1[i*img.cols+j] = fgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
-//                        }
-//                        else{
-//                            px1[i*img.cols+j] = bgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
-//                        }
-//                    }
-//                }
-//                return true;
-//            }, T)
-//        );
-//    }
+    unsigned long threadCnt = num_threads(img.rows*img.cols);
+    unsigned long rowsPerThread = (img.rows+threadCnt-1)/threadCnt; // 注意向上取整
+    std::vector<std::future<bool> > finished;
+    volatile uint8_t * const px1 = PixToComp.ptr<uint8_t>(0);
+    cv::Vec3b const * const px2 = img.ptr<cv::Vec3b>(0);
 
-//    for(int T=0;T<threadCnt;T++){
-//        finished[T].wait();
-//    }
-
-    for(int i=0;i<img.rows;i++){
-        for(int j=0;j<img.cols;j++){
-            if(mask.at<uint8_t>(i,j)&1){
-                uint8_t* px1 = PixToComp.ptr<uint8_t>(0);
-                cv::Vec3b const * px2 = img.ptr<cv::Vec3b>(0);
-                px1[i*img.cols+j] = fgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
-            }
-            else{
-                uint8_t* px1 = PixToComp.ptr<uint8_t>(0);
-                cv::Vec3b const * px2 = img.ptr<cv::Vec3b>(0);
-                px1[i*img.cols+j] = bgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
-            }
-        }
+    for(int T=0;T<threadCnt;T++){
+        finished.emplace_back(
+            thdp.enqueue([&](int Tnum)->bool{
+                for(int i=Tnum*rowsPerThread;i<(Tnum+1)*rowsPerThread&&i<img.rows;i++){
+                    for(int j=0;j<img.cols;j++){
+                        if(mask.at<uint8_t>(i,j)&1){
+                            px1[i*img.cols+j] = fgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+                        }
+                        else{
+                            px1[i*img.cols+j] = bgdGMM.whichComponent(static_cast<cv::Vec3d>(px2[i*img.cols+j]));
+                        }
+                    }
+                }
+                return true;
+            }, T)
+        );
     }
 
+    for(int T=0;T<threadCnt;T++){
+        finished[T].wait();
+    }
 }
 
 void learnGMMs(cv::Mat const & img, cv::Mat const & mask, GMM & fgdGMM, GMM & bgdGMM, cv::Mat const & PixToComp){
